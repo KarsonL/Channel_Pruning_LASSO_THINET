@@ -9,7 +9,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
 import torch.autograd as autograd
-from torch.optim.lr_scheduler import LambdaLR
 
 import torchvision.models as models
 
@@ -22,16 +21,20 @@ from datasets.cifar100 import *
 from utils.metrics import AverageMeter, cls_accuracy
 from utils.misc import timeit, print_cuda_statistics
 from math import cos, pi
-# from Cosine_Annealing_with_Warmup import *
+
 cudnn.benchmark = True
-from torch.optim.lr_scheduler import _LRScheduler
 
 
-
-class VGG_BN_cifar(BaseAgent):
+class VGG_BN_CIFAR(BaseAgent):
     def __init__(self, config):
         super().__init__(config)
-
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.manual_seed(1)
+        torch.cuda.manual_seed(1)
+        random.seed(1)
+        np.random.seed(1)
+        
         # set device
         self.is_cuda = torch.cuda.is_available()
         if self.is_cuda and not self.config.cuda:
@@ -83,8 +86,8 @@ class VGG_BN_cifar(BaseAgent):
         self.loss_fn = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9, weight_decay=0.0005,
                                          nesterov=True)
-        # self.scheduler = optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=self.config.milestones,
-        #                                                 gamma=self.config.gamma)
+        self.scheduler = optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=self.config.milestones,
+                                                        gamma=self.config.gamma)
         self.model = self.model.to(self.device)
         self.loss_fn = self.loss_fn.to(self.device)
 
@@ -225,18 +228,6 @@ class VGG_BN_cifar(BaseAgent):
                 module_surgery(m, bn, next_m, indices_stayed)
                 self.stayed_channels[str(i) + '.conv'] = set(indices_stayed)
             return
-        
-        elif method == "first_k":
-            for i, m in enumerate(list(self.named_conv_list.values())[:-1]):    # 마지막 레이어 전까지
-                bn = self.named_modules_list[str(i) + '.bn']
-                if str(i + 1) + '.conv' in self.named_conv_list:
-                    next_m = self.named_modules_list[str(i + 1) + '.conv']
-                else:
-                    next_m = self.model.classifier[0]
-                indices_stayed = [i for i in range(math.floor(m.out_channels * k))]
-                module_surgery(m, bn, next_m, indices_stayed)
-                self.stayed_channels[str(i) + '.conv'] = set(indices_stayed)
-            return
 
         inputs, _ = next(iter(self.data_loader.train_loader))
         if self.cuda:
@@ -294,6 +285,7 @@ class VGG_BN_cifar(BaseAgent):
                     self.stayed_channels[str(i) + '.conv'] = set(indices_stayed)
 
         elif method == 'lasso':
+
             for i, m in enumerate(list(self.named_conv_list.values())[:-1]):    # 마지막 레이어 전까지
                 if isinstance(m, torch.nn.Conv2d):
                     next_m_idx = self.named_modules_idx_list[str(i + 1) + '.conv']
@@ -306,10 +298,12 @@ class VGG_BN_cifar(BaseAgent):
                     next_output_features = self.original_conv_output[str(i + 1) + '.conv']
                     next_m_idx = self.named_conv_idx_list[str(i + 1) + '.conv']
                     pruned_next_inputs_features = self.model.features[:next_m_idx](inputs)
-                    weight_reconstruction(next_m, pruned_next_inputs_features, next_output_features, use_gpu=self.cuda)
+#                     weight_reconstruction(next_m, pruned_next_inputs_features, next_output_features, use_gpu=self.cuda)
                     self.stayed_channels[str(i) + '.conv'] = set(indices_stayed)
-
                     
+            self.config.batch_size = 128
+            self.data_loader = Cifar100DataLoader(config=self.config)   # data loader
+            
     def adjust_learning_rate(self,optimizer, epoch, iteration, num_iter):
         warmup_epoch = 5
         warmup_iter = warmup_epoch * num_iter
@@ -326,49 +320,32 @@ class VGG_BN_cifar(BaseAgent):
 
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-
-
+            
     @timeit
-    def train(self, specializing=False, freeze_conv=False):
+    def train(self, specializing=False, freeze_conv=False, cosine_decay = False):
         """
         Main training function, with per-epoch model saving
         :return:
         """
+        self.lr_list = []
+
         if freeze_conv:
             for param in self.model.features.parameters():
                 param.requires_grad = False
-
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.1, momentum=0.9, weight_decay=0.0005,
-                                         nesterov=True)
         
         last_conv = list(self.named_conv_list.values())[-1]
         self.model.classifier = torch.nn.Linear(last_conv.out_channels, 100)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=196, eta_min=0, last_epoch=-1)
-
-        # self.scheduler = CosineAnnealingWarmUpRestarts(self.optimizer, T_0=10, T_mult=2, eta_max=0.1, T_up=10,gamma=1.,
-        #                                                last_epoch=-1)
-
-        # self.scheduler = optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=self.config.milestones,
-        #                                               gamma=self.config.gamma)
-        # self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0 = 10, T_mult= 2)
-
+        
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9, weight_decay=0.0005,
+                                         nesterov=True)
+        self.scheduler = optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=self.config.milestones,
+                                                        gamma=self.config.gamma)
         self.model.to(self.device)
-        self.param_dict = {
-            'epochs': self.config.max_epoch,
-            'steps': self.data_loader.train_iterations,
-            't_max': self.data_loader.train_iterations * 5,
-            't_mult': 2,
-            'eta_min': 0,
-            'lr': 0.1,
-            'whole_decay': True,
-            'out_name': "T_0={}-T_mult={}".format(self.data_loader.train_iterations * 1, 2),
-        }
 
-        self.lr_list = []
         history = []
         for epoch in range(self.config.max_epoch):
             self.current_epoch = epoch
-            self.train_one_epoch(specializing)
+            self.train_one_epoch(specializing,cosine_decay)
 
             if specializing:
                 sub_valid_acc = []
@@ -380,7 +357,9 @@ class VGG_BN_cifar(BaseAgent):
             if is_best:
                 self.best_valid_acc = valid_acc
             self.save_checkpoint(is_best=is_best)
+
             history.append(valid_acc)
+            self.scheduler.step()
 
         if freeze_conv:
             for param in self.model.features.parameters():
@@ -388,7 +367,7 @@ class VGG_BN_cifar(BaseAgent):
 
         return self.best_valid_acc, history
 
-    def train_one_epoch(self, specializing=False):
+    def train_one_epoch(self, specializing=False,cosine_decay = False):
         """
         One epoch training function
         :return:
@@ -411,9 +390,10 @@ class VGG_BN_cifar(BaseAgent):
         for i,(x, y) in enumerate(tqdm_batch):
             if self.cuda:
                 x, y = x.cuda(non_blocking=self.config.async_loading), y.cuda(non_blocking=self.config.async_loading)
-            now_itr = self.current_epoch * self.param_dict['steps'] + i
-            now_lr = self.scheduler.get_lr()
+
             self.optimizer.zero_grad()
+            if cosine_decay :
+                self.adjust_learning_rate(self.optimizer, self.current_epoch, i, self.data_loader.train_iterations)
 
             pred = self.model(x)
             cur_loss = self.loss_fn(pred, y)
@@ -424,16 +404,6 @@ class VGG_BN_cifar(BaseAgent):
 
             cur_loss.backward()
             self.optimizer.step()
-            self.scheduler.step()
-            if self.optimizer.param_groups[0]['lr'] == self.param_dict['eta_min']:
-                if self.param_dict['whole_decay']:
-                    annealed_lr = self.param_dict['lr'] * (1 + math.cos(
-                        math.pi * now_itr / (self.param_dict['epochs'] * self.param_dict['steps']) )) / 2
-                    self.optimizer.param_groups[0]['initial_lr'] = annealed_lr
-                self.param_dict['t_max'] *= self.param_dict['t_mult']
-                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    self.optimizer, T_max=self.param_dict['t_max'], eta_min=self.param_dict['eta_min'], last_epoch=-1)
-            # self.scheduler.step(self.current_epoch + i/ self.data_loader.train_iterations)
 
             if specializing:
                 top1 = cls_accuracy(pred.data, y.data)
@@ -448,8 +418,6 @@ class VGG_BN_cifar(BaseAgent):
             self.current_iteration += 1
             current_batch += 1
             
-
-        print('current learning rate : ', self.optimizer.param_groups[0]['lr'] , now_lr)
         self.lr_list.append(self.optimizer.param_groups[0]['lr'])
         tqdm_batch.close()
 
